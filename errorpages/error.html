@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+{{$code := placeholder "http.error.status_code"}}
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{$code}} - {{if eq $code "404"}}Page Not Found{{else if eq $code "403"}}Not Available{{else if eq $code "423"}}Coming Soon{{else}}Error{{end}}</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      background: #ffffff;
+      color: #111827;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      display: flex; align-items: center; justify-content: center;
+      min-height: 100dvh; padding: 24px; text-align: center;
+    }
+    h1 { font-size: clamp(30px, 6vw, 46px); font-weight: 800; letter-spacing: -0.02em; margin-bottom: 14px; }
+    p { font-size: clamp(15px, 2.4vw, 18px); color: #6b7280; margin-bottom: 26px; }
+    a.btn {
+      display: inline-block; text-decoration: none;
+      background: #111827; color: #ffffff;
+      font-size: 13px; font-weight: 600;
+      padding: 10px 20px; border-radius: 999px;
+      transition: opacity 0.15s ease;
+    }
+    a.btn:hover { opacity: 0.85; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{{$code}} - {{if eq $code "404"}}Page Not Found{{else if eq $code "403"}}Not Available{{else if eq $code "423"}}Coming Soon{{else}}Error{{end}}</h1>
+    <p>{{if eq $code "404"}}Oops! The page you're looking for doesn't exist.{{else if eq $code "403"}}This site isn't available yet.{{else if eq $code "423"}}This site hasn't been published yet.{{else}}Something went wrong. Please try again.{{end}}</p>
+    <a class="btn" href="/">Back to Home</a>
+  </main>
+</body>
+</html>

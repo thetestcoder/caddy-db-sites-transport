@@ -47,6 +47,11 @@ type Handler struct {
 	customDomainRouteQuery         string
 	customDomainPublishedPageQuery string
 	customDomainStatusQuery        string
+
+	accountValuesQuery   string
+	contactStandardQuery string
+	contactCustomQuery   string
+	customDomainSEOQuery string
 }
 
 type publishedSite struct {
@@ -56,9 +61,10 @@ type publishedSite struct {
 	PageSlug    string
 	FunnelSlug  string
 	FunnelType  string
-	UpdatedAt   time.Time
-	CacheETag   string
-	ResolvedVia routeKind
+	UpdatedAt    time.Time
+	CacheETag    string
+	ResolvedVia  routeKind
+	SubAccountID string
 }
 
 type customDomainFunnel struct {
@@ -76,6 +82,7 @@ type customDomainFunnel struct {
 	RouteMode       string
 	RequestedFunnel string
 	RequestedPage   string
+	SubAccountID    string
 }
 
 func (*Handler) CaddyModule() caddy.ModuleInfo {
@@ -108,6 +115,10 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	)
 	h.customDomainPublishedPageQuery = fmt.Sprintf(customDomainPublishedPageSQLTemplate, qualifiedTable(h.Schema, "published_sites"))
 	h.customDomainStatusQuery = fmt.Sprintf(customDomainStatusSQLTemplate, qualifiedTable(h.Schema, "platform_domains"), qualifiedTable(h.Schema, "site_funnels"))
+	h.accountValuesQuery = fmt.Sprintf(accountValuesSQLTemplate, qualifiedTable(h.Schema, "account_custom_values"))
+	h.contactStandardQuery = fmt.Sprintf(contactStandardSQLTemplate, qualifiedTable(h.Schema, "contacts"))
+	h.contactCustomQuery = fmt.Sprintf(contactCustomSQLTemplate, qualifiedTable(h.Schema, "contact_custom_field_values"), qualifiedTable(h.Schema, "custom_fields"))
+	h.customDomainSEOQuery = fmt.Sprintf(customDomainSEOSQLTemplate, qualifiedTable(h.Schema, "platform_domains"), qualifiedTable(h.Schema, "site_funnels"))
 
 	cfg, err := pgxpool.ParseConfig(h.DatabaseURL)
 	if err != nil {
@@ -214,6 +225,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		h.logger.Info("db_sites cache clear requested", zap.String("host", host), zap.String("path", r.URL.Path))
 		return h.serveCacheClear(w, r)
 	}
+	if kind := seoFileKind(r.URL.Path); kind != "" {
+		h.logger.Info("db_sites seo file requested", zap.String("host", host), zap.String("kind", kind))
+		return h.serveSEOFile(w, r, host, kind)
+	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		h.logger.Warn("db_sites request rejected: method not allowed",
@@ -253,25 +268,40 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return caddyhttp.Error(code, fmt.Errorf(http.StatusText(code)))
 	}
 
+	// Resolve custom-field / custom-value merge tokens per request. The cached
+	// copy keeps raw tokens, so editing a value takes effect without republishing.
+	// Token-free pages skip this entirely (no extra query, cached ETag stays stable).
+	served := site
+	if htmlHasMergeTokens(site.HTML) {
+		values := h.buildMergeValues(r.Context(), site.SubAccountID, r.URL.Query().Get("cid"))
+		resolved := replaceMergeTokens(site.HTML, values)
+		if resolved != site.HTML {
+			cp := *site
+			cp.HTML = resolved
+			cp.CacheETag = weakETag(resolved)
+			served = &cp
+		}
+	}
+
 	status := http.StatusOK
-	if etagMatches(r, site.CacheETag) {
+	if etagMatches(r, served.CacheETag) {
 		status = http.StatusNotModified
 	}
 	h.logger.Info("db_sites request completed: serving html",
 		zap.String("host", host),
 		zap.String("raw_page_slug", target.PageSlug),
-		zap.String("normalized_page_slug", site.PageSlug),
-		zap.String("funnel_slug", site.FunnelSlug),
-		zap.String("published_slug", site.Slug),
-		zap.String("title", site.Title),
-		zap.String("funnel_type", site.FunnelType),
-		zap.Time("published_updated_at", site.UpdatedAt),
-		zap.Int("html_bytes", len(site.HTML)),
-		zap.String("etag", site.CacheETag),
+		zap.String("normalized_page_slug", served.PageSlug),
+		zap.String("funnel_slug", served.FunnelSlug),
+		zap.String("published_slug", served.Slug),
+		zap.String("title", served.Title),
+		zap.String("funnel_type", served.FunnelType),
+		zap.Time("published_updated_at", served.UpdatedAt),
+		zap.Int("html_bytes", len(served.HTML)),
+		zap.String("etag", served.CacheETag),
 		zap.Int("status", status),
 		zap.Duration("duration", time.Since(start)),
 	)
-	writeHTML(w, r, site, h.CacheControl)
+	writeHTML(w, r, served, h.CacheControl)
 	return nil
 }
 
@@ -355,7 +385,10 @@ func (h *Handler) lookupCustomDomainPublishedSite(ctx context.Context, target ro
 		zap.String("expected_published_slug", publishedSlug),
 	)
 
-	key := cacheKey(normalizedTarget)
+	// Include the funnel id in the cache key: two funnels on the same custom
+	// domain can share a page slug (e.g. both have "index"), so a host+slug key
+	// alone collides and serves the wrong funnel's page.
+	key := cacheKey(normalizedTarget) + "|" + funnel.ID
 	if site, found, hit, code := h.cache.get(key); hit {
 		h.logger.Info("db_sites cache hit",
 			zap.String("cache_key", key),
@@ -419,6 +452,7 @@ func (h *Handler) queryCustomDomainPublishedPage(ctx context.Context, target rou
 	site.ResolvedVia = target.Kind
 	site.PageSlug = target.PageSlug
 	site.FunnelSlug = funnel.Slug
+	site.SubAccountID = funnel.SubAccountID
 	row := h.pool.QueryRow(ctx, h.customDomainPublishedPageQuery, funnel.ID, publishedSlug)
 	if err := row.Scan(&site.Slug, &site.Title, &site.FunnelType, &site.HTML, &site.UpdatedAt); err != nil {
 		if err == pgx.ErrNoRows {
@@ -472,6 +506,7 @@ func (h *Handler) lookupCustomDomainFunnel(ctx context.Context, target routeTarg
 		&funnel.PageIsHomepage,
 		&funnel.PageHTMLBytes,
 		&funnel.RouteMode,
+		&funnel.SubAccountID,
 	)
 	if err == pgx.ErrNoRows {
 		h.logger.Info("db_sites custom domain funnel query returned no rows",
@@ -812,6 +847,8 @@ WITH candidates AS (
 	SELECT
 		sf.id,
 		sf.slug,
+		sf.serve_at_root,
+		sf.sub_account_id,
 		sf.status AS funnel_status,
 		pd.status AS domain_status,
 		COALESCE(pd.purpose, '') AS purpose,
@@ -820,6 +857,7 @@ WITH candidates AS (
 	JOIN %s sf ON sf.platform_domain_id = pd.id
 	WHERE lower(pd.domain) = lower($1)
 	   OR lower(sf.domain) = lower($1)
+	   OR (pd.include_www AND lower('www.' || pd.domain) = lower($1))
 ),
 selected_funnel AS (
 	SELECT
@@ -829,6 +867,7 @@ selected_funnel AS (
 		candidates.domain_status AS domain_status,
 		candidates.purpose AS purpose,
 		candidates.funnel_slug_matched AS funnel_slug_matched,
+		candidates.sub_account_id AS sub_account_id,
 		CASE
 			WHEN candidates.funnel_slug_matched THEN NULLIF($3, '')
 			ELSE NULLIF($2, '')
@@ -858,6 +897,7 @@ selected_funnel AS (
 	)
 	ORDER BY
 		CASE WHEN candidates.funnel_slug_matched THEN 0 ELSE 1 END,
+		CASE WHEN candidates.serve_at_root THEN 0 ELSE 1 END,
 		CASE WHEN candidates.funnel_status = 'published' THEN 0 ELSE 1 END,
 		CASE WHEN sp.status = 'published' THEN 0 ELSE 1 END,
 		sp.is_homepage DESC,
@@ -878,7 +918,8 @@ SELECT
 	sp.status,
 	sp.is_homepage,
 	COALESCE(LENGTH(sp.html_content), 0),
-	sf.route_mode
+	sf.route_mode,
+	sf.sub_account_id::text
 FROM selected_funnel sf
 JOIN %s sp ON sp.funnel_id = sf.funnel_id
 WHERE (
@@ -917,6 +958,7 @@ SELECT
 FROM %s pd
 LEFT JOIN %s sf ON sf.platform_domain_id = pd.id
 WHERE lower(pd.domain) = lower($1)
+   OR (pd.include_www AND lower('www.' || pd.domain) = lower($1))
 LIMIT 1`
 
 const domainDiagnosticsSQLTemplate = `
@@ -951,6 +993,7 @@ LEFT JOIN %s ps ON ps.funnel_id = sf.id AND ps.slug = sf.slug || '--' || COALESC
 WHERE lower(pd.domain) = lower($1)
    OR lower(sf.domain) = lower($1)
    OR lower(ps.custom_domain) = lower($1)
+   OR (pd.include_www AND lower('www.' || pd.domain) = lower($1))
 LIMIT 10`
 
 var (

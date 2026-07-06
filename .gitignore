@@ -35,3 +35,8 @@ go.work.sum
 Thumbs.db
 .idea/
 .vscode/
+
+# local test build/config
+caddy-dbsites
+Caddyfile.local
+buildenv_*
