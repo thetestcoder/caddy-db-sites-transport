@@ -26,7 +26,7 @@ func init() {
 }
 
 const defaultCacheClearPath = "/db-sites/cache/clear"
-const routeQueryVersion = "custom-domain-route-v4-rpc-stored-column"
+const routeQueryVersion = "custom-domain-route-v3-explicit-status-aliases"
 
 var safeIdentifier = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
@@ -74,7 +74,6 @@ type customDomainFunnel struct {
 	PageIsHomepage  bool
 	PageHTMLBytes   int64
 	RouteMode       string
-	SubAccountID    string
 	RequestedFunnel string
 	RequestedPage   string
 }
@@ -101,7 +100,12 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if !safeIdentifier.MatchString(h.Schema) {
 		return fmt.Errorf("db_sites: invalid schema %q (must match %s)", h.Schema, safeIdentifier.String())
 	}
-	h.customDomainRouteQuery = customDomainRouteRPC
+	h.customDomainRouteQuery = fmt.Sprintf(customDomainRouteSQLTemplate,
+		qualifiedTable(h.Schema, "platform_domains"),
+		qualifiedTable(h.Schema, "site_funnels"),
+		qualifiedTable(h.Schema, "site_pages"),
+		qualifiedTable(h.Schema, "site_pages"),
+	)
 	h.customDomainPublishedPageQuery = fmt.Sprintf(customDomainPublishedPageSQLTemplate, qualifiedTable(h.Schema, "published_sites"))
 	h.customDomainStatusQuery = fmt.Sprintf(customDomainStatusSQLTemplate, qualifiedTable(h.Schema, "platform_domains"), qualifiedTable(h.Schema, "site_funnels"))
 
@@ -468,7 +472,6 @@ func (h *Handler) lookupCustomDomainFunnel(ctx context.Context, target routeTarg
 		&funnel.PageIsHomepage,
 		&funnel.PageHTMLBytes,
 		&funnel.RouteMode,
-		&funnel.SubAccountID,
 	)
 	if err == pgx.ErrNoRows {
 		h.logger.Info("db_sites custom domain funnel query returned no rows",
@@ -804,7 +807,94 @@ type domainDiagnostic struct {
 	HTMLBytes             sql.NullInt64
 }
 
-const customDomainRouteRPC = `SELECT * FROM resolve_caddy_page($1, $2, $3)`
+const customDomainRouteSQLTemplate = `
+WITH candidates AS (
+	SELECT
+		sf.id,
+		sf.slug,
+		sf.status AS funnel_status,
+		pd.status AS domain_status,
+		COALESCE(pd.purpose, '') AS purpose,
+		CASE WHEN sf.slug = $2 THEN true ELSE false END AS funnel_slug_matched
+	FROM %s pd
+	JOIN %s sf ON sf.platform_domain_id = pd.id
+	WHERE lower(pd.domain) = lower($1)
+	   OR lower(sf.domain) = lower($1)
+),
+selected_funnel AS (
+	SELECT
+		candidates.id AS funnel_id,
+		candidates.slug AS funnel_slug,
+		candidates.funnel_status AS funnel_status,
+		candidates.domain_status AS domain_status,
+		candidates.purpose AS purpose,
+		candidates.funnel_slug_matched AS funnel_slug_matched,
+		CASE
+			WHEN candidates.funnel_slug_matched THEN NULLIF($3, '')
+			ELSE NULLIF($2, '')
+		END AS requested_page_slug,
+		CASE
+			WHEN candidates.funnel_slug_matched THEN 'funnel_slug_prefix'
+			ELSE 'domain_default'
+		END AS route_mode
+	FROM candidates
+	JOIN %s sp ON sp.funnel_id = candidates.id
+	WHERE (
+		CASE
+			WHEN candidates.funnel_slug_matched THEN NULLIF($3, '')
+			ELSE NULLIF($2, '')
+		END IS NULL
+		AND sp.is_homepage = true
+	)
+	OR (
+		CASE
+			WHEN candidates.funnel_slug_matched THEN NULLIF($3, '')
+			ELSE NULLIF($2, '')
+		END IS NOT NULL
+		AND sp.slug = CASE
+			WHEN candidates.funnel_slug_matched THEN NULLIF($3, '')
+			ELSE NULLIF($2, '')
+		END
+	)
+	ORDER BY
+		CASE WHEN candidates.funnel_slug_matched THEN 0 ELSE 1 END,
+		CASE WHEN candidates.funnel_status = 'published' THEN 0 ELSE 1 END,
+		CASE WHEN sp.status = 'published' THEN 0 ELSE 1 END,
+		sp.is_homepage DESC,
+		sp.sort_order,
+		sp.updated_at DESC,
+		candidates.slug
+	LIMIT 1
+)
+SELECT
+	sf.funnel_id::text,
+	sf.funnel_slug,
+	sf.funnel_status,
+	sf.domain_status,
+	sf.purpose,
+	sp.id::text,
+	sp.slug,
+	COALESCE(sp.name, ''),
+	sp.status,
+	sp.is_homepage,
+	COALESCE(LENGTH(sp.html_content), 0),
+	sf.route_mode
+FROM selected_funnel sf
+JOIN %s sp ON sp.funnel_id = sf.funnel_id
+WHERE (
+	sf.requested_page_slug IS NULL
+	AND sp.is_homepage = true
+)
+OR (
+	sf.requested_page_slug IS NOT NULL
+	AND sp.slug = sf.requested_page_slug
+)
+ORDER BY
+	CASE WHEN sp.status = 'published' THEN 0 ELSE 1 END,
+	sp.is_homepage DESC,
+	sp.sort_order,
+	sp.updated_at DESC
+LIMIT 1`
 
 const customDomainPublishedPageSQLTemplate = `
 SELECT
@@ -844,7 +934,7 @@ SELECT
 	sp.name,
 	sp.is_homepage,
 	sp.status,
-	COALESCE(sp.html_content_length, 0),
+	LENGTH(sp.html_content),
 	sp.updated_at,
 	CASE
 		WHEN sf.slug IS NULL THEN NULL
